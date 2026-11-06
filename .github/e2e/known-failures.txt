@@ -1,0 +1,5 @@
+# Postman checks that fail because of app behaviour, not the pipeline.
+# Format: <request name> :: <assertion>. Any failure not listed here fails the job.
+
+# The API does not keep the order of tagList as submitted.
+Articles by Tag :: The second tag is training

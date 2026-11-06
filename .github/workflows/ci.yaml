@@ -1,0 +1,339 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main, dev]
+  push:
+    branches: [main, dev]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  IMAGE: realworld-backend
+  AWS_REGION: us-east-1
+  ECR_PUSH_ROLE_ARN: arn:aws:iam::973122996566:role/realworld-bootstrap-gha-ecr-push
+  PLATFORM_REPO: realworld-platform
+  K6_IMAGE: grafana/k6:2.3.0
+  NEWMAN_IMAGE: postman/newman:6.1.3-ubuntu
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-ci.txt
+      - run: pip install -r requirements-ci.txt
+      - run: make lint
+
+  test:
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      APP_ENV: test
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: conduit_test
+      JWT_SECRET_KEY: ci-only
+      SECRET_KEY: ci-only
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - run: pip install -r requirements.txt
+      - name: Unit and API tests
+        run: python -m pytest --cov=conduit --cov-report=term --cov-report=xml ./tests
+      - name: Pipeline script tests
+        run: python -m pytest -q -p no:cacheprovider .github/perf .github/e2e
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage
+          path: coverage.xml
+          retention-days: 7
+
+  build:
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: meta
+        run: echo "tag=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64
+          provenance: false
+          tags: ${{ env.IMAGE }}:${{ steps.meta.outputs.tag }}
+          outputs: type=docker,dest=${{ runner.temp }}/image.tar
+          cache-from: type=gha,scope=backend
+          cache-to: type=gha,mode=max,scope=backend
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: image
+          path: ${{ runner.temp }}/image.tar
+          retention-days: 1
+
+  scan:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: image
+          path: ${{ runner.temp }}
+      - name: Report HIGH and CRITICAL vulnerabilities
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          input: ${{ runner.temp }}/image.tar
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          format: table
+          output: trivy.txt
+          exit-code: "0"
+      - name: Add report to the job summary
+        if: always()
+        run: |
+          { echo '### Trivy (HIGH, CRITICAL with a fix)'; echo '```'; cat trivy.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      # Report only: fixable CRITICAL findings mark this step as failed and leave an
+      # annotation on the run, but do not block the deploy.
+      - name: Flag fixable CRITICAL vulnerabilities
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        continue-on-error: true
+        with:
+          input: ${{ runner.temp }}/image.tar
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+          skip-setup-trivy: true
+
+  e2e:
+    needs: build
+    runs-on: ubuntu-24.04
+    env:
+      TAG: ${{ needs.build.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: image
+          path: ${{ runner.temp }}
+      - run: docker load -i "$RUNNER_TEMP/image.tar"
+      - run: .github/scripts/stack.sh up e2e "$IMAGE:$TAG"
+      - name: Postman collection
+        run: |
+          out="$RUNNER_TEMP/e2e" && mkdir -p "$out" && chmod 777 "$out"
+          # newman exits non-zero on known failures too; check_failures.py decides.
+          docker run --rm --network e2e \
+            -v "$PWD/postman:/postman:ro" -v "$out:/out" \
+            -e APIURL=http://e2e-api:8080/api \
+            --entrypoint bash "$NEWMAN_IMAGE" /postman/run-api-tests.sh \
+            --reporters cli,json --reporter-json-export /out/report.json || true
+          python3 .github/e2e/check_failures.py "$out/report.json" .github/e2e/known-failures.txt
+      - name: API logs
+        if: failure()
+        run: docker logs e2e-api
+      - if: always()
+        run: .github/scripts/stack.sh down e2e
+
+  perf:
+    needs: build
+    runs-on: ubuntu-24.04
+    env:
+      TAG: ${{ needs.build.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: image
+          path: ${{ runner.temp }}
+      - run: docker load -i "$RUNNER_TEMP/image.tar"
+      # Baseline: the target branch for a pull request, the previous head for a push.
+      - id: base
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          sha=$([ "$EVENT" = pull_request ] && echo "$PR_BASE" || echo "$BEFORE")
+          [ "$sha" = 0000000000000000000000000000000000000000 ] && sha=""
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        id: base_checkout
+        if: steps.base.outputs.sha != ''
+        continue-on-error: true
+        with:
+          ref: ${{ steps.base.outputs.sha }}
+          path: baseline
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        id: base_build
+        if: steps.base_checkout.outcome == 'success'
+        continue-on-error: true
+        with:
+          context: baseline
+          platforms: linux/amd64
+          provenance: false
+          load: true
+          tags: ${{ env.IMAGE }}:baseline
+          cache-from: type=gha,scope=backend
+      - name: Load tests
+        env:
+          HAS_BASELINE: ${{ steps.base_build.outcome == 'success' }}
+        run: |
+          out="$RUNNER_TEMP/perf" && mkdir -p "$out" && chmod 777 "$out"
+          run_k6() {
+            .github/scripts/stack.sh up "perf-$1" "$2"
+            docker run --rm --network "perf-$1" -u "$(id -u)" \
+              -v "$PWD/.github/perf:/perf:ro" -v "$out:/out" \
+              -e API_URL="http://perf-$1-api:8080/api" \
+              "$K6_IMAGE" run --quiet --summary-export "/out/$1.json" /perf/scenario.js
+            .github/scripts/stack.sh down "perf-$1"
+          }
+          if [ "$HAS_BASELINE" = true ]; then run_k6 baseline "$IMAGE:baseline"; fi
+          run_k6 candidate "$IMAGE:$TAG"
+      - name: Compare with baseline
+        run: python3 .github/perf/compare.py "$RUNNER_TEMP/perf/baseline.json" "$RUNNER_TEMP/perf/candidate.json" | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: perf
+          path: ${{ runner.temp }}/perf
+          retention-days: 7
+
+  push-image:
+    needs: [lint, test, build, scan, e2e, perf]
+    # Deploys only from pushes; dev stays off until the dev environment exists.
+    if: >-
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/main' ||
+       (github.ref == 'refs/heads/dev' && vars.DEV_DEPLOY_ENABLED == 'true'))
+    runs-on: ubuntu-24.04
+    # No GitHub environment here: it would change the OIDC subject, and the ECR push
+    # role trusts repository branches.
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      env: ${{ steps.target.outputs.env }}
+    env:
+      TAG: ${{ needs.build.outputs.tag }}
+    steps:
+      - id: target
+        run: echo "env=$([ "$GITHUB_REF_NAME" = main ] && echo prod || echo dev)" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: image
+          path: ${{ runner.temp }}
+      - run: docker load -i "$RUNNER_TEMP/image.tar"
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ env.ECR_PUSH_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
+        id: ecr
+      - name: Push image
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          TARGET_ENV: ${{ steps.target.outputs.env }}
+        run: |
+          repo="realworld-$TARGET_ENV-backend"
+          # Tags are immutable in ECR; a re-run of the same commit skips the push.
+          if aws ecr describe-images --repository-name "$repo" --image-ids imageTag="$TAG" >/dev/null 2>&1; then
+            echo "$repo:$TAG already exists"
+            exit 0
+          fi
+          docker tag "$IMAGE:$TAG" "$REGISTRY/$repo:$TAG"
+          docker push "$REGISTRY/$repo:$TAG"
+
+  update-gitops:
+    needs: [build, push-image]
+    runs-on: ubuntu-24.04
+    environment: ${{ needs.push-image.outputs.env }}
+    concurrency:
+      group: gitops-${{ needs.push-image.outputs.env }}
+      cancel-in-progress: false
+    env:
+      TAG: ${{ needs.build.outputs.tag }}
+      TARGET_ENV: ${{ needs.push-image.outputs.env }}
+    steps:
+      - uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        id: app
+        with:
+          client-id: ${{ vars.DEPLOY_APP_CLIENT_ID }}
+          private-key: ${{ secrets.DEPLOY_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ env.PLATFORM_REPO }}
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.repository_owner }}/${{ env.PLATFORM_REPO }}
+          ref: main
+          token: ${{ steps.app.outputs.token }}
+          path: platform
+      - name: Commit the new image tag
+        working-directory: platform
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          APP_SLUG: ${{ steps.app.outputs.app-slug }}
+        run: |
+          bot="${APP_SLUG}[bot]"
+          bot_id=$(gh api "/users/$bot" --jq .id)
+          git config user.name "$bot"
+          git config user.email "$bot_id+$bot@users.noreply.github.com"
+
+          file="gitops/realworld/values-$TARGET_ENV.yaml"
+          # Retries cover a concurrent frontend deploy pushing to the same branch.
+          for attempt in 1 2 3 4 5; do
+            git fetch -q origin main
+            git reset -q --hard origin/main
+            yq -i ".backend.image.tag = \"$TAG\"" "$file"
+            if git diff --quiet; then
+              echo "backend $TAG is already deployed to $TARGET_ENV"
+              exit 0
+            fi
+            git commit -q -am "Deploy backend $TAG to $TARGET_ENV" \
+              -m "Source: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/commit/$GITHUB_SHA"
+            git push -q origin HEAD:main && exit 0
+            sleep $((attempt * 5))
+          done
+          echo "could not push the tag update" >&2
+          exit 1
