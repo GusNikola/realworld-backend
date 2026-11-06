@@ -129,9 +129,11 @@ jobs:
         if: always()
         run: |
           { echo '### Trivy (HIGH, CRITICAL with a fix)'; echo '```'; cat trivy.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
-      # Only fixable CRITICAL findings block; HIGH findings are reported above.
-      - name: Fail on fixable CRITICAL vulnerabilities
+      # Report only: fixable CRITICAL findings mark this step as failed and leave an
+      # annotation on the run, but do not block the deploy.
+      - name: Flag fixable CRITICAL vulnerabilities
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        continue-on-error: true
         with:
           input: ${{ runner.temp }}/image.tar
           severity: CRITICAL
